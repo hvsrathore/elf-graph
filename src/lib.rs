@@ -9,6 +9,8 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
+pub mod tui;
+
 /// Represents a function or call target node in the call graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionNode {
