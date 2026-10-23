@@ -1,3 +1,8 @@
+/* integration tests for ELF call graph generation and disassembly.
+   compiles a synthetic C test binary using GCC without optimizations (-O0) to ensure function
+   calls are preserved rather than inlined by the compiler, then parses its symbol table,
+   detects PLT stubs, and verifies reconstructed call graph edges and machine instruction decoding. */
+
 use std::fs;
 use std::process::Command;
 use elf_graph::build_call_graph;
@@ -8,6 +13,7 @@ fn test_call_graph_c_binary_with_plt() {
     let src_path = temp_dir.join("test_callgraph_src.c");
     let bin_path = temp_dir.join("test_callgraph_bin");
 
+    /* synthetic C program with a deterministic chain of direct function calls and a dynamic library call (puts) */
     let c_code = r#"
 #include <stdio.h>
 
@@ -36,6 +42,8 @@ int main() {
 
     fs::write(&src_path, c_code).expect("Failed to write test C file");
 
+    /* compile with -O0 (no optimizations/inlining), -no-pie (fixed virtual addresses),
+       and -fno-omit-frame-pointer for clean call instructions */
     let status = Command::new("gcc")
         .args([
             "-O0",
@@ -52,14 +60,14 @@ int main() {
 
     let call_graph = build_call_graph(&bin_path).expect("Failed to build call graph");
 
-    // Verify main node exists
+    /* verify main node exists in the reconstructed call graph */
     let main_nodes = call_graph.find_nodes_by_name("main");
     assert!(!main_nodes.is_empty(), "main function must be found");
 
     let main_idx = main_nodes[0];
     let callees = call_graph.outgoing_calls(main_idx);
 
-    // Main should call func_a and puts@plt
+    /* main should call func_a directly and puts via PLT trampoline stub */
     let callee_names: Vec<&str> = callees.iter().map(|(n, _)| n.name.as_str()).collect();
     println!("Main callees: {:?}", callee_names);
 
@@ -72,28 +80,28 @@ int main() {
         "main must call puts (or puts@plt)"
     );
 
-    // Verify func_a calls func_b
+    /* verify func_a calls func_b */
     let func_a_nodes = call_graph.find_nodes_by_name("func_a");
     assert!(!func_a_nodes.is_empty());
     let a_callees = call_graph.outgoing_calls(func_a_nodes[0]);
     let a_callee_names: Vec<&str> = a_callees.iter().map(|(n, _)| n.name.as_str()).collect();
     assert!(a_callee_names.contains(&"func_b"));
 
-    // Verify func_b calls func_c
+    /* verify func_b calls func_c */
     let func_b_nodes = call_graph.find_nodes_by_name("func_b");
     assert!(!func_b_nodes.is_empty());
     let b_callees = call_graph.outgoing_calls(func_b_nodes[0]);
     let b_callee_names: Vec<&str> = b_callees.iter().map(|(n, _)| n.name.as_str()).collect();
     assert!(b_callee_names.contains(&"func_c"));
 
-    // Verify func_c calls func_d
+    /* verify func_c calls func_d */
     let func_c_nodes = call_graph.find_nodes_by_name("func_c");
     assert!(!func_c_nodes.is_empty());
     let c_callees = call_graph.outgoing_calls(func_c_nodes[0]);
     let c_callee_names: Vec<&str> = c_callees.iter().map(|(n, _)| n.name.as_str()).collect();
     assert!(c_callee_names.contains(&"func_d"));
 
-    // Test disassembly of main using iced-x86
+    /* test disassembly of main using iced-x86 instruction decoder */
     let main_func = &call_graph.graph[main_idx];
     let disasm = call_graph.disassemble_function(main_func.address, main_func.size);
     assert!(!disasm.is_empty(), "disassembly of main must not be empty");
@@ -110,7 +118,7 @@ int main() {
         "main must have a disassembled call targeting func_a"
     );
 
-    // Clean up
+    /* clean up temporary compilation artifacts */
     let _ = fs::remove_file(&src_path);
     let _ = fs::remove_file(&bin_path);
 }

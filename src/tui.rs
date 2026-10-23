@@ -1,3 +1,10 @@
+/* interactive terminal user interface (TUI) for exploring binary call graphs.
+   built on top of ratatui and crossterm, providing a 3-pane layout:
+   - left pane: incoming callers (functions that call the current function, Direction::Incoming)
+   - center pane: collapsible callee tree (functions called up to depth 3, Direction::Outgoing)
+   - right pane: disassembled x86_64 machine instructions with CALL targets highlighted in yellow
+   - popup fuzzy search: modal symbol lookup powered by fuzzy-matcher (SkimMatcherV2) */
+
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -16,48 +23,80 @@ use ratatui::DefaultTerminal;
 
 use crate::{CallEdge, CallGraph, DisassembledLine, FunctionNode};
 
-/// Represents which pane currently has keyboard focus.
+/* represents which pane currently has active keyboard navigation focus.
+   in terminal interfaces without mouse interaction, active focus determines
+   which pane receives directional navigation keys (j/k, up/down). */
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPane {
-    /// Left pane: Incoming callers
+    /* left pane: incoming callers (functions that invoke the active function) */
     Callers,
-    /// Center pane: Outgoing callee tree
+    /* center pane: outgoing callee tree (functions invoked by the active function) */
     Callees,
 }
 
-/// Represents a node in the callee tree (up to depth 3).
+/* represents an entry in the recursive callee tree up to a maximum depth of 3.
+   in binary call graphs, functions can invoke each other in cycles (recursion or mutual recursion).
+   TreeNode records whether recursion was detected along its path to avoid infinite loops. */
 #[derive(Debug, Clone)]
 pub struct TreeNode {
+    /* unique numeric identifier assigned during depth-first tree traversal */
     pub id: usize,
+    /* graph index in the petgraph DiGraph representing the function metadata */
     pub node_idx: NodeIndex,
+    /* tree depth level (0 = root function, 1 = direct callees, 2 = grandchildren, etc.) */
     pub depth: usize,
+    /* virtual instruction address in the caller function where the CALL took place */
     pub call_site: Option<u64>,
+    /* nested child nodes representing downstream callees */
     pub children: Vec<TreeNode>,
+    /* flag set to true if this function was already encountered higher in the current call branch (recursion) */
     pub is_recursive: bool,
 }
 
-/// A visible row in the flattened collapsible tree view.
+/* a single flattened line displayed in the collapsible callee tree view.
+   Ratatui renders widgets row by row; hierarchical tree structures are therefore flattened
+   into a sequential list of visible rows based on which nodes are expanded or collapsed. */
 #[derive(Debug, Clone)]
 pub struct VisibleRow {
+    /* matching unique TreeNode identifier */
     pub tree_id: usize,
+    /* graph index in the petgraph DiGraph */
     pub node_idx: NodeIndex,
+    /* depth indentation level used for rendering tree branch glyphs */
     pub depth: usize,
+    /* virtual instruction address of the call instruction */
     pub call_site: Option<u64>,
+    /* whether the node's children are currently visible or collapsed */
     pub is_expanded: bool,
+    /* whether this node has downstream callees that can be expanded or collapsed */
     pub has_children: bool,
+    /* whether this node represents a recursive call cycle */
     pub is_recursive: bool,
 }
 
-/// State for the popup fuzzy search bar.
+/* state for the modal popup fuzzy symbol search dialog triggered by the '/' key.
+   allows searching across thousands of demangled function names and PLT stubs. */
 pub struct SearchState {
+    /* whether the search popup overlay is currently active and capturing keyboard events */
     pub is_open: bool,
+    /* user's current search input string */
     pub query: String,
+    /* filtered matching symbols as (NodeIndex, match_score) pairs */
     pub results: Vec<(NodeIndex, i64)>,
+    /* index of the currently highlighted result row in the search list */
     pub selected_idx: usize,
+    /* vertical scroll offset for pagination of search results */
     pub scroll_offset: usize,
 }
 
+impl Default for SearchState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SearchState {
+    /* creates a fresh, initially closed search state */
     pub fn new() -> Self {
         Self {
             is_open: false,
@@ -68,6 +107,7 @@ impl SearchState {
         }
     }
 
+    /* opens the modal search popup, clears any previous query, and populates initial results */
     pub fn open(&mut self, graph: &DiGraph<FunctionNode, CallEdge>) {
         self.is_open = true;
         self.query.clear();
@@ -76,6 +116,8 @@ impl SearchState {
         self.update_results(graph);
     }
 
+    /* re-evaluates the user's search query against all symbols in the call graph using SkimMatcherV2.
+       sorts matches by score descending, or by PLT stub status and alphabetical order if query is empty. */
     pub fn update_results(&mut self, graph: &DiGraph<FunctionNode, CallEdge>) {
         let matcher = SkimMatcherV2::default();
         let query = self.query.trim();
@@ -112,12 +154,14 @@ impl SearchState {
         }
     }
 
+    /* moves the search selection down by one row */
     pub fn move_down(&mut self) {
         if self.selected_idx + 1 < self.results.len() {
             self.selected_idx += 1;
         }
     }
 
+    /* moves the search selection up by one row */
     pub fn move_up(&mut self) {
         if self.selected_idx > 0 {
             self.selected_idx -= 1;
@@ -125,26 +169,42 @@ impl SearchState {
     }
 }
 
-/// TUI Application state.
+/* central application state holding navigation history, layout focus, and cached rendering data */
 pub struct AppState {
+    /* filename or path of the binary being analyzed, shown in the header */
     pub binary_name: String,
+    /* graph index of the function currently being inspected */
     pub current_node: NodeIndex,
+    /* navigation history stack for back-navigation (Backspace pops previous functions) */
     pub history: Vec<NodeIndex>,
+    /* pane currently holding keyboard focus (Callers vs Callees) */
     pub focused_pane: FocusedPane,
+    /* cursor selection index within the center callee tree */
     pub selected_index: usize,
+    /* cursor selection index within the left incoming callers list */
     pub caller_selected_index: usize,
+    /* vertical scroll offset for the center callee tree */
     pub scroll_offset: usize,
+    /* vertical scroll offset for the left callers list */
     pub caller_scroll_offset: usize,
+    /* vertical scroll offset for the right disassembly view */
     pub disasm_scroll_offset: usize,
+    /* set of TreeNode IDs that the user has toggled collapsed */
     pub collapsed_ids: HashSet<usize>,
+    /* hierarchical tree structure of outgoing callees up to depth 3 */
     pub tree_root: TreeNode,
+    /* flattened list of visible callee tree rows taking collapsed state into account */
     pub visible_rows: Vec<VisibleRow>,
+    /* pre-computed list of incoming callers and their call sites for instantaneous rendering */
     pub cached_callers: Vec<(NodeIndex, u64)>,
+    /* pre-decoded x86_64 machine instructions for current_node to ensure 60 FPS rendering without lag */
     pub cached_disasm: Vec<DisassembledLine>,
+    /* state of the interactive fuzzy symbol search modal */
     pub search: SearchState,
 }
 
 impl AppState {
+    /* initializes the TUI application state rooted at initial_node */
     pub fn new(call_graph: &CallGraph, initial_node: NodeIndex, binary_name: String) -> Self {
         let mut app = Self {
             binary_name,
@@ -175,7 +235,7 @@ impl AppState {
         app
     }
 
-    /// Rebuilds callee tree, caller list, and disassembly cache for `current_node`.
+    /* rebuilds callee tree, caller list, and disassembly cache for current_node */
     pub fn rebuild_tree(&mut self, call_graph: &CallGraph) {
         let mut next_id = 0;
         let mut ancestors = Vec::new();
@@ -197,7 +257,7 @@ impl AppState {
             self.selected_index = 0;
         }
 
-        // Cache incoming callers
+        /* cache incoming callers (functions that contain CALL instructions targeting current_node) */
         let mut callers: Vec<_> = call_graph
             .graph
             .edges_directed(self.current_node, Direction::Incoming)
@@ -207,7 +267,7 @@ impl AppState {
         self.cached_callers = callers;
         self.caller_selected_index = 0;
 
-        // Cache disassembly of current function
+        /* cache disassembly of current function so Ratatui's 50ms render loop does not re-decode machine code */
         let cur_func = &call_graph.graph[self.current_node];
         self.cached_disasm =
             call_graph.disassemble_function(cur_func.address, cur_func.size);
@@ -218,7 +278,7 @@ impl AppState {
         self.sync_disasm_to_selected();
     }
 
-    /// Automatically scrolls disassembly to the callsite of the currently selected callee.
+    /* automatically scrolls disassembly to the callsite of the currently selected callee */
     pub fn sync_disasm_to_selected(&mut self) {
         if let Some(row) = self.visible_rows.get(self.selected_index) {
             if let Some(site) = row.call_site {
@@ -229,7 +289,8 @@ impl AppState {
         }
     }
 
-    /// Recursively constructs the callee tree up to `max_depth`.
+    /* recursively constructs the callee tree up to max_depth using depth-first search (DFS).
+       tracks ancestors along the current call chain to prevent infinite recursion on recursive functions. */
     fn build_callee_tree(
         graph: &DiGraph<FunctionNode, CallEdge>,
         current_idx: NodeIndex,
@@ -253,7 +314,7 @@ impl AppState {
                 .map(|edge| (edge.target(), edge.weight().call_site))
                 .collect();
 
-            // Sort by call site address for deterministic layout
+            /* sort outgoing call edges by call site address for deterministic, sequential code order */
             outgoing.sort_by_key(|(_, site)| *site);
 
             for (target_idx, site) in outgoing {
@@ -281,7 +342,7 @@ impl AppState {
         }
     }
 
-    /// Flattens the tree into currently visible rows based on `collapsed_ids`.
+    /* flattens the tree into currently visible rows based on collapsed_ids */
     pub fn refresh_visible_rows(&mut self) {
         self.visible_rows.clear();
         Self::flatten_tree(&self.tree_root, &self.collapsed_ids, &mut self.visible_rows);
@@ -291,6 +352,7 @@ impl AppState {
         }
     }
 
+    /* recursive helper that traverses expanded TreeNode children and appends VisibleRow records */
     fn flatten_tree(
         node: &TreeNode,
         collapsed: &HashSet<usize>,
@@ -316,7 +378,7 @@ impl AppState {
         }
     }
 
-    /// Toggle pane focus between Callers (Left) and Callees (Center).
+    /* toggle pane focus between Callers (left) and Callees (center) */
     pub fn toggle_pane_focus(&mut self) {
         self.focused_pane = match self.focused_pane {
             FocusedPane::Callees => FocusedPane::Callers,
@@ -324,7 +386,7 @@ impl AppState {
         };
     }
 
-    /// Move selection down in the currently focused pane.
+    /* move selection down in the currently focused pane */
     pub fn move_down(&mut self) {
         match self.focused_pane {
             FocusedPane::Callees => {
@@ -341,7 +403,7 @@ impl AppState {
         }
     }
 
-    /// Move selection up in the currently focused pane.
+    /* move selection up in the currently focused pane */
     pub fn move_up(&mut self) {
         match self.focused_pane {
             FocusedPane::Callees => {
@@ -358,17 +420,17 @@ impl AppState {
         }
     }
 
-    /// Scroll disassembly pane down.
+    /* scroll disassembly pane down */
     pub fn disasm_scroll_down(&mut self) {
         self.disasm_scroll_offset = self.disasm_scroll_offset.saturating_add(6);
     }
 
-    /// Scroll disassembly pane up.
+    /* scroll disassembly pane up */
     pub fn disasm_scroll_up(&mut self) {
         self.disasm_scroll_offset = self.disasm_scroll_offset.saturating_sub(6);
     }
 
-    /// Toggle expansion of the selected tree item.
+    /* toggle expansion of the selected tree item */
     pub fn toggle_expand(&mut self) {
         if self.focused_pane == FocusedPane::Callees {
             if let Some(row) = self.visible_rows.get(self.selected_index) {
@@ -384,24 +446,16 @@ impl AppState {
         }
     }
 
-    /// Jump into the selected function from either the Callee Tree or Caller Pane.
+    /* jump into the selected function from either the Callee Tree or Caller Pane */
     pub fn jump_into_selected(&mut self, call_graph: &CallGraph) {
         let target_node = match self.focused_pane {
             FocusedPane::Callees => {
-                if let Some(row) = self.visible_rows.get(self.selected_index) {
-                    Some(row.node_idx)
-                } else {
-                    None
-                }
+                self.visible_rows.get(self.selected_index).map(|row| row.node_idx)
             }
             FocusedPane::Callers => {
-                if let Some(&(caller_idx, _)) =
-                    self.cached_callers.get(self.caller_selected_index)
-                {
-                    Some(caller_idx)
-                } else {
-                    None
-                }
+                self.cached_callers
+                    .get(self.caller_selected_index)
+                    .map(|&(caller_idx, _)| caller_idx)
             }
         };
 
@@ -414,7 +468,7 @@ impl AppState {
         }
     }
 
-    /// Pop back to the previous function from history (`Backspace`).
+    /* pop back to the previous function from history (Backspace) */
     pub fn pop_history(&mut self, call_graph: &CallGraph) {
         if let Some(prev) = self.history.pop() {
             self.current_node = prev;
@@ -423,7 +477,8 @@ impl AppState {
     }
 }
 
-/// Runs the Ratatui + Crossterm interactive TUI.
+/* runs the Ratatui + Crossterm interactive TUI.
+   initializes terminal raw mode, sets up alternate screen buffer, and restores the terminal upon exit. */
 pub fn run_tui(call_graph: &CallGraph, start_node: NodeIndex, binary_name: String) -> Result<()> {
     let mut terminal = ratatui::init();
     let mut app = AppState::new(call_graph, start_node, binary_name);
@@ -434,6 +489,7 @@ pub fn run_tui(call_graph: &CallGraph, start_node: NodeIndex, binary_name: Strin
     res
 }
 
+/* main event loop: draws UI frames and polls for keyboard events at 50ms intervals */
 fn run_app(
     terminal: &mut DefaultTerminal,
     call_graph: &CallGraph,
@@ -447,12 +503,12 @@ fn run_app(
         if event::poll(Duration::from_millis(50))? {
             let ev = event::read()?;
             if let Event::Key(key) = ev {
-                // Ignore key release events to prevent double processing or missed repeats
+                /* ignore key release events to prevent double processing or missed repeats */
                 if key.kind == KeyEventKind::Release {
                     continue;
                 }
 
-                // Check if popup search is active
+                /* check if popup search is active and intercept keyboard inputs */
                 if app.search.is_open {
                     match key.code {
                         KeyCode::Esc => {
@@ -511,7 +567,7 @@ fn run_app(
                         _ => {}
                     }
                 } else {
-                    // Normal mode keybindings
+                    /* normal navigation mode keybindings */
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                             break;
@@ -578,10 +634,11 @@ fn run_app(
     Ok(())
 }
 
+/* renders the full TUI screen: header, 3 main panes, footer status bar, and popup modal */
 fn render_ui(frame: &mut ratatui::Frame, call_graph: &CallGraph, app: &mut AppState) {
     let size = frame.area();
 
-    // Vertical layout: Header (3 lines), Main 3-Pane area (remaining), Footer (3 lines)
+    /* vertical layout: header (3 lines), main 3-pane area (remaining), footer (3 lines) */
     let chunks = Layout::default()
         .direction(LayoutDirection::Vertical)
         .constraints([
@@ -595,7 +652,7 @@ fn render_ui(frame: &mut ratatui::Frame, call_graph: &CallGraph, app: &mut AppSt
     let main_area = chunks[1];
     let footer_area = chunks[2];
 
-    // Horizontal split for the 3 Panes: Left (24%), Center (38%), Right (38%)
+    /* horizontal split for the 3 panes: left (24%), center (38%), right (38%) */
     let pane_chunks = Layout::default()
         .direction(LayoutDirection::Horizontal)
         .constraints([
@@ -609,27 +666,28 @@ fn render_ui(frame: &mut ratatui::Frame, call_graph: &CallGraph, app: &mut AppSt
     let center_area = pane_chunks[1];
     let right_area = pane_chunks[2];
 
-    // 1. Render Header
+    /* 1. render header displaying binary name and navigation breadcrumb trail */
     render_header(frame, header_area, call_graph, app);
 
-    // 2. Render Left Pane (Callers - Direction::Incoming)
+    /* 2. render left pane (callers - Direction::Incoming) */
     render_left_pane(frame, left_area, call_graph, app);
 
-    // 3. Render Center Pane (Callee Tree - Direction::Outgoing up to Depth 3)
+    /* 3. render center pane (callee tree - Direction::Outgoing up to depth 3) */
     render_center_pane(frame, center_area, call_graph, app);
 
-    // 4. Render Right Pane (Disassembly of currently focused function using iced-x86)
+    /* 4. render right pane (disassembly of currently focused function using iced-x86) */
     render_right_pane(frame, right_area, call_graph, app);
 
-    // 5. Render Footer
+    /* 5. render footer status bar with keybinding hints */
     render_footer(frame, footer_area, app);
 
-    // 6. Render Popup Fuzzy Search Modal (if active)
+    /* 6. render popup fuzzy search modal (if active) */
     if app.search.is_open {
         render_search_popup(frame, call_graph, &mut app.search);
     }
 }
 
+/* renders the header bar showing binary information and the breadcrumb navigation trail */
 fn render_header(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -674,6 +732,7 @@ fn render_header(
     frame.render_widget(header_para, area);
 }
 
+/* renders the left pane showing all functions that call the currently inspected function */
 fn render_left_pane(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -771,6 +830,7 @@ fn render_left_pane(
     frame.render_widget(para, area);
 }
 
+/* renders the center pane displaying the interactive collapsible callee tree up to depth 3 */
 fn render_center_pane(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -919,6 +979,8 @@ fn render_center_pane(
     frame.render_widget(para, area);
 }
 
+/* renders the right pane displaying disassembled x86_64 machine code decoded by iced-x86.
+   highlights CALL instructions in yellow and annotates them with resolved target symbol names. */
 fn render_right_pane(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -971,7 +1033,7 @@ fn render_right_pane(
             .take(inner_height)
         {
             if line.is_call {
-                // Highlight CALL instruction lines in bold yellow!
+                /* highlight CALL instruction lines in bold yellow to make control flow transfers stand out */
                 let mut spans = vec![
                     Span::styled(
                         format!(" 0x{:08x}:  ", line.ip),
@@ -996,7 +1058,7 @@ fn render_right_pane(
                 }
                 lines.push(Line::from(spans));
             } else {
-                // Regular instructions
+                /* regular non-call machine instructions rendered in muted white and gray */
                 let spans = vec![
                     Span::styled(
                         format!(" 0x{:08x}:  ", line.ip),
@@ -1016,6 +1078,7 @@ fn render_right_pane(
     frame.render_widget(para, area);
 }
 
+/* renders the bottom footer bar displaying shortcut keybindings and navigation history depth */
 fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &AppState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1056,7 +1119,7 @@ fn render_footer(frame: &mut ratatui::Frame, area: Rect, app: &AppState) {
     frame.render_widget(para, area);
 }
 
-/// Helper to center a rectangular area on screen.
+/* helper function to calculate a centered rectangle on the screen for modal popups */
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(LayoutDirection::Vertical)
@@ -1077,7 +1140,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Renders the modal popup fuzzy search dialog.
+/* renders the modal popup fuzzy search dialog for quick symbol jumping */
 fn render_search_popup(
     frame: &mut ratatui::Frame,
     call_graph: &CallGraph,
@@ -1111,7 +1174,7 @@ fn render_search_popup(
                 .add_modifier(Modifier::BOLD),
         ));
 
-    // Render outer block first
+    /* render outer modal block with rounded double border */
     frame.render_widget(block, area);
 
     let inner_layout = Layout::default()
@@ -1123,7 +1186,7 @@ fn render_search_popup(
     let input_area = inner_layout[0];
     let results_area = inner_layout[1];
 
-    // Search query box
+    /* search query input box with cursor block */
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1137,7 +1200,7 @@ fn render_search_popup(
     ]);
     frame.render_widget(Paragraph::new(input_line).block(input_block), input_area);
 
-    // Filtered results list
+    /* filtered symbol search results list with fuzzy match scores */
     let list_height = results_area.height as usize;
     if search.selected_idx < search.scroll_offset {
         search.scroll_offset = search.selected_idx;
@@ -1216,6 +1279,7 @@ mod tests {
     use crate::{CallEdge, FunctionNode, SymbolMap};
     use petgraph::graph::DiGraph;
 
+    /* creates a minimal synthetic call graph with known functions and PLT stubs for unit testing */
     fn create_test_call_graph() -> (CallGraph, NodeIndex, NodeIndex, NodeIndex) {
         let mut g = DiGraph::new();
         let main = g.add_node(FunctionNode {
@@ -1254,6 +1318,7 @@ mod tests {
         (cg, main, func_a, puts_plt)
     }
 
+    /* test callee tree construction, navigation down/up, jumping into functions, and popping history */
     #[test]
     fn test_tree_construction_and_navigation() {
         let (cg, main, func_a, puts_plt) = create_test_call_graph();
@@ -1289,6 +1354,7 @@ mod tests {
         assert_eq!(app.history.len(), 0);
     }
 
+    /* test collapsing and expanding nodes in the center callee tree */
     #[test]
     fn test_collapse_expand() {
         let (cg, main, _func_a, _puts_plt) = create_test_call_graph();
@@ -1304,6 +1370,7 @@ mod tests {
         assert_eq!(app.visible_rows.len(), total_initial);
     }
 
+    /* test modal fuzzy symbol search query filtering and ranking */
     #[test]
     fn test_fuzzy_search_state() {
         let (cg, _main, func_a, puts_plt) = create_test_call_graph();

@@ -7,6 +7,7 @@ use clap::Parser;
 use elf_graph::build_call_graph;
 use elf_graph::tui::run_tui;
 
+/* command line arguments parsed via clap */
 #[derive(Parser, Debug)]
 #[command(
     name = "elf-graph",
@@ -15,43 +16,45 @@ use elf_graph::tui::run_tui;
     about = "Disassembles x86_64 ELF binaries, reconstructs call graphs with petgraph, and explores with an interactive Ratatui TUI"
 )]
 struct Args {
-    /// Path to the x86_64 ELF binary to analyze
-    #[arg(value_name = "BINARY")]
+    /* path to the target x86_64 ELF binary to disassemble and analyze */
+    #[arg(value_name = "BINARY", help = "path to the x86_64 ELF binary to analyze")]
     binary: PathBuf,
 
-    /// Function name to inspect or start TUI exploration from (default: "main")
-    #[arg(short, long, default_value = "main")]
+    /* symbol name to inspect or use as initial root in the TUI (defaults to "main") */
+    #[arg(short, long, default_value = "main", help = "function name to inspect or start TUI exploration from")]
     function: String,
 
-    /// Print text adjacency lists for all functions in the binary
-    #[arg(short, long)]
+    /* dump text adjacency lists for all functions in the binary to stdout */
+    #[arg(short, long, help = "print text adjacency lists for all functions in the binary")]
     all: bool,
 
-    /// Export the reconstructed call graph to Graphviz DOT format
-    #[arg(long)]
+    /* export the full graph to standard Graphviz DOT format for graph visualization tools */
+    #[arg(long, help = "export the reconstructed call graph to Graphviz DOT format")]
     dot: bool,
 
-    /// Print text adjacency list to stdout (non-interactive mode)
-    #[arg(long)]
+    /* force non-interactive CLI mode even when running in a terminal */
+    #[arg(long, help = "print text adjacency list to stdout (non-interactive mode)")]
     cli: bool,
 
-    /// Launch interactive 3-pane Ratatui TUI
-    #[arg(short, long)]
+    /* launch interactive Ratatui TUI explorer */
+    #[arg(short, long, help = "launch interactive 3-pane Ratatui TUI")]
     tui: bool,
 
-    /// Print summary statistics of the reconstructed call graph
-    #[arg(short, long)]
+    /* print summary statistics such as total functions, PLT stubs, and call edges */
+    #[arg(short, long, help = "print summary statistics of the reconstructed call graph")]
     stats: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    /* verify that the provided binary path exists on the filesystem */
     if !args.binary.exists() {
         eprintln!("Error: Binary file not found: {}", args.binary.display());
         process::exit(1);
     }
 
+    /* launch TUI if explicitly requested or if running interactively in a terminal without dump flags */
     let should_launch_tui =
         args.tui || (!args.dot && !args.all && !args.cli && std::io::stdout().is_terminal());
 
@@ -59,6 +62,7 @@ fn main() -> Result<()> {
         eprintln!("Analyzing ELF binary: {}", args.binary.display());
     }
 
+    /* parse the ELF binary, resolve symbols/PLT, disassemble .text, and construct the petgraph DiGraph */
     let call_graph = match build_call_graph(&args.binary) {
         Ok(cg) => cg,
         Err(err) => {
@@ -75,11 +79,13 @@ fn main() -> Result<()> {
         .filter(|n| n.is_plt)
         .count();
 
+    /* handle DOT graph export request */
     if args.dot {
         println!("{}", call_graph.to_dot());
         return Ok(());
     }
 
+    /* handle full adjacency list print request */
     if args.all {
         println!("=== Adjacency Lists for All Functions ===");
         for node_idx in call_graph.graph.node_indices() {
@@ -91,11 +97,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Locate requested function (default: "main")
+    /* locate requested function symbol (defaults to "main") */
     let target_func = &args.function;
     let mut matching_nodes = call_graph.find_nodes_by_name(target_func);
 
-    // Prioritize functions with more outgoing calls (e.g. user `crate::main` over runtime stub)
+    /* prioritize functions with more outgoing direct calls so user code (e.g. crate::main) precedes runtime stubs */
     matching_nodes.sort_by(|&a, &b| {
         let out_b = call_graph
             .graph
@@ -111,7 +117,7 @@ fn main() -> Result<()> {
     let start_node = if !matching_nodes.is_empty() {
         matching_nodes[0]
     } else {
-        // Fallback to non-PLT function with the most outgoing calls
+        /* fallback to the non-PLT function with the highest out-degree (most outgoing calls) */
         call_graph
             .graph
             .node_indices()
@@ -125,7 +131,7 @@ fn main() -> Result<()> {
             .unwrap_or_else(|| call_graph.graph.node_indices().next().unwrap())
     };
 
-    // Launch interactive TUI
+    /* launch interactive Ratatui TUI */
     if should_launch_tui {
         let binary_name = args
             .binary
@@ -138,7 +144,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // CLI mode: print statistics and adjacency list verification
+    /* CLI non-interactive mode: output call graph summary and adjacency list of matched symbols */
     if args.stats || !args.all {
         println!(
             "Successfully built call graph: {} functions/targets (including {} PLT stubs), {} direct call edges",
