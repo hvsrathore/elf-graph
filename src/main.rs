@@ -93,16 +93,35 @@ fn main() -> Result<()> {
 
     // Locate requested function (default: "main")
     let target_func = &args.function;
-    let matching_nodes = call_graph.find_nodes_by_name(target_func);
+    let mut matching_nodes = call_graph.find_nodes_by_name(target_func);
+
+    // Prioritize functions with more outgoing calls (e.g. user `crate::main` over runtime stub)
+    matching_nodes.sort_by(|&a, &b| {
+        let out_b = call_graph
+            .graph
+            .edges_directed(b, petgraph::Direction::Outgoing)
+            .count();
+        let out_a = call_graph
+            .graph
+            .edges_directed(a, petgraph::Direction::Outgoing)
+            .count();
+        out_b.cmp(&out_a)
+    });
 
     let start_node = if !matching_nodes.is_empty() {
         matching_nodes[0]
     } else {
-        // Fallback to first non-PLT function or first node
+        // Fallback to non-PLT function with the most outgoing calls
         call_graph
             .graph
             .node_indices()
-            .find(|&idx| !call_graph.graph[idx].is_plt)
+            .filter(|&idx| !call_graph.graph[idx].is_plt)
+            .max_by_key(|&idx| {
+                call_graph
+                    .graph
+                    .edges_directed(idx, petgraph::Direction::Outgoing)
+                    .count()
+            })
             .unwrap_or_else(|| call_graph.graph.node_indices().next().unwrap())
     };
 

@@ -93,6 +93,23 @@ int main() {
     let c_callee_names: Vec<&str> = c_callees.iter().map(|(n, _)| n.name.as_str()).collect();
     assert!(c_callee_names.contains(&"func_d"));
 
+    // Test disassembly of main using iced-x86
+    let main_func = &call_graph.graph[main_idx];
+    let disasm = call_graph.disassemble_function(main_func.address, main_func.size);
+    assert!(!disasm.is_empty(), "disassembly of main must not be empty");
+
+    let call_instructions: Vec<_> = disasm.iter().filter(|i| i.is_call).collect();
+    assert!(
+        call_instructions.len() >= 2,
+        "main must have at least 2 call instructions"
+    );
+    assert!(
+        call_instructions
+            .iter()
+            .any(|c| c.target_symbol.as_deref() == Some("func_a")),
+        "main must have a disassembled call targeting func_a"
+    );
+
     // Clean up
     let _ = fs::remove_file(&src_path);
     let _ = fs::remove_file(&bin_path);

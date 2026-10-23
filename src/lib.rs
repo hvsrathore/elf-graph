@@ -3,13 +3,32 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use iced_x86::{Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
-use object::{File, Object, ObjectSection, ObjectSymbol, RelocationTarget, SymbolKind};
+use iced_x86::{Decoder, DecoderOptions, Formatter, IntelFormatter, Instruction, Mnemonic, OpKind};
+use object::{File, Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionKind, SymbolKind};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 
 pub mod tui;
+
+/// Represents an executable section stored for runtime disassembly.
+#[derive(Debug, Clone)]
+pub struct ExecutableSection {
+    pub name: String,
+    pub address: u64,
+    pub data: Vec<u8>,
+}
+
+/// A disassembled instruction line with call analysis.
+#[derive(Debug, Clone)]
+pub struct DisassembledLine {
+    pub ip: u64,
+    pub bytes: Vec<u8>,
+    pub instruction_text: String,
+    pub is_call: bool,
+    pub call_target: Option<u64>,
+    pub target_symbol: Option<String>,
+}
 
 /// Represents a function or call target node in the call graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,9 +151,85 @@ pub struct CallGraph {
     pub graph: DiGraph<FunctionNode, CallEdge>,
     pub node_indices: HashMap<u64, NodeIndex>,
     pub symbol_map: SymbolMap,
+    pub exec_sections: Vec<ExecutableSection>,
 }
 
 impl CallGraph {
+    /// Retrieve function byte slice from stored executable sections.
+    pub fn get_function_bytes(&self, addr: u64, size: u64) -> Option<&[u8]> {
+        for sec in &self.exec_sections {
+            if addr >= sec.address && addr < sec.address + sec.data.len() as u64 {
+                let offset = (addr - sec.address) as usize;
+                let max_avail = sec.data.len() - offset;
+                let len = if size > 0 {
+                    (size as usize).min(max_avail)
+                } else {
+                    max_avail.min(256)
+                };
+                return Some(&sec.data[offset..offset + len]);
+            }
+        }
+        None
+    }
+
+    /// Disassemble a function's instructions using iced-x86.
+    pub fn disassemble_function(&self, addr: u64, size: u64) -> Vec<DisassembledLine> {
+        let Some(bytes) = self.get_function_bytes(addr, size) else {
+            return Vec::new();
+        };
+
+        let mut decoder = Decoder::with_ip(64, bytes, addr, DecoderOptions::NONE);
+        let mut formatter = IntelFormatter::new();
+        let mut output = String::new();
+        let mut instr = Instruction::default();
+        let mut lines = Vec::new();
+
+        while decoder.can_decode() {
+            let ip = decoder.ip();
+            let start_offset = (ip.saturating_sub(addr)) as usize;
+            decoder.decode_out(&mut instr);
+            let instr_len = instr.len();
+
+            let instr_bytes = if start_offset < bytes.len() {
+                let end = (start_offset + instr_len).min(bytes.len());
+                bytes[start_offset..end].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            output.clear();
+            formatter.format(&instr, &mut output);
+
+            let is_call = instr.mnemonic() == Mnemonic::Call;
+            let mut call_target = None;
+            let mut target_symbol = None;
+
+            if is_call {
+                if matches!(
+                    instr.op0_kind(),
+                    OpKind::NearBranch16 | OpKind::NearBranch32 | OpKind::NearBranch64
+                ) {
+                    let target = instr.near_branch_target();
+                    call_target = Some(target);
+                    if let Some(sym) = self.symbol_map.resolve(target) {
+                        target_symbol = Some(sym.name.clone());
+                    }
+                }
+            }
+
+            lines.push(DisassembledLine {
+                ip,
+                bytes: instr_bytes,
+                instruction_text: output.clone(),
+                is_call,
+                call_target,
+                target_symbol,
+            });
+        }
+
+        lines
+    }
+
     /// Retrieve all node indices with a matching name.
     /// Supports exact matching, normalized demangled matching (without crate disambiguators),
     /// suffix matching (e.g. `main` matching `crate::main`), and substring fallback.
@@ -490,10 +585,28 @@ impl<'a> ElfCallGraphBuilder<'a> {
             }
         }
 
+        // 5. Collect executable sections for runtime disassembly
+        let mut exec_sections = Vec::new();
+        for sec in self.file.sections() {
+            let name = sec.name().unwrap_or("");
+            if sec.kind() == SectionKind::Text || name.contains("plt") || name == ".init" || name == ".fini" {
+                if let Ok(data) = sec.data() {
+                    if !data.is_empty() {
+                        exec_sections.push(ExecutableSection {
+                            name: name.to_string(),
+                            address: sec.address(),
+                            data: data.to_vec(),
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(CallGraph {
             graph,
             node_indices,
             symbol_map,
+            exec_sections,
         })
     }
 
